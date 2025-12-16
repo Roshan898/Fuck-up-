@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # =================================================
-# Viral Video Bot with Preview + Prev/Next Buttons
-# Single Script | Render Ready
+# Viral Video Bot – Correct & Stable
 # =================================================
 
+import os
 import logging
 import sqlite3
 from datetime import datetime
@@ -23,10 +23,10 @@ from telegram.ext import (
 )
 
 # ===================== CONFIG =====================
-BOT_TOKEN = "8359828511:AAH-TBlWFfDH_3T_MRM8YPULbb52mH3z12g"
-ADMIN_ID = 6567632240           # your Telegram numeric ID
-FORCE_JOIN = "@duvkuppp"    # channel or group username
-HOW_TO_WATCH_LINK = "https://t.me/yourchannel/123"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+FORCE_JOIN = os.environ.get("FORCE_JOIN")  # @channel
+HOW_TO_WATCH_LINK = os.environ.get("HOW_TO_WATCH_LINK", "https://t.me/")
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -55,58 +55,185 @@ conn.commit()
 
 # ===================== STATE ======================
 user_states = {}
-user_pages = {}  # user_id -> index
+user_pages = {}
 
 # ================= FORCE JOIN =====================
 async def is_joined(bot, user_id):
     try:
-        m = await bot.get_chat_member(FORCE_JOIN, user_id)
-        return m.status in ("member", "administrator", "creator")
+        member = await bot.get_chat_member(FORCE_JOIN, user_id)
+        return member.status in ("member", "administrator", "creator")
     except:
         return False
 
-# ================= SEND PREVIEW ===================
+# ================= SEND CARD =====================
 async def send_card(bot, chat_id, video, index, total):
     title, link, file_id, file_type = video
-    caption = f"<b>{title}</b>\n{link}\n\n📄 {index+1}/{total}"
+    caption = f"<b>{title}</b>\n🔗 {link}\n\n📄 {index+1}/{total}"
 
     buttons = []
     if index > 0:
-        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev"))
+        buttons.append(InlineKeyboardButton("⬅ Previous", callback_data="prev"))
     if index < total - 1:
-        buttons.append(InlineKeyboardButton("Next ➡️", callback_data="next"))
+        buttons.append(InlineKeyboardButton("Next ➡", callback_data="next"))
 
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
 
-    if file_id and file_type == "photo":
-        await bot.send_photo(chat_id, file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
-    elif file_id and file_type == "video":
-        await bot.send_video(chat_id, file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+    if file_type == "photo":
+        await bot.send_photo(chat_id, file_id, caption=caption,
+                             parse_mode="HTML", reply_markup=reply_markup)
+    elif file_type == "video":
+        await bot.send_video(chat_id, file_id, caption=caption,
+                             parse_mode="HTML", reply_markup=reply_markup)
     else:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=reply_markup)
+        await bot.send_message(chat_id, caption,
+                               parse_mode="HTML", reply_markup=reply_markup)
 
 # ===================== START ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    if not await is_joined(context.bot, user.id):
-        btn = [[InlineKeyboardButton("✅ Join Channel", url=f"https://t.me/{FORCE_JOIN.replace('@','')}")]]
-        await update.message.reply_text("❌ Join channel first.", reply_markup=InlineKeyboardMarkup(btn))
+    if FORCE_JOIN and not await is_joined(context.bot, user.id):
+        btn = [[InlineKeyboardButton(
+            "✅ Join Channel",
+            url=f"https://t.me/{FORCE_JOIN.replace('@','')}"
+        )]]
+        await update.message.reply_text(
+            "❌ Please join the channel first.",
+            reply_markup=InlineKeyboardMarkup(btn)
+        )
         return
 
     cur.execute("INSERT OR IGNORE INTO users VALUES(?)", (user.id,))
     conn.commit()
 
-    kb = [
+    keyboard = [
         [InlineKeyboardButton("🔥 Viral Videos", callback_data="viral")],
-        [InlineKeyboardButton("📺 How to Watch", callback_data="how")],
-        [InlineKeyboardButton("🔍 Search Video", callback_data="search")]
+        [InlineKeyboardButton("📺 How to Watch", callback_data="how")]
     ]
 
-    await update.message.reply_text("🔥 <b>Welcome</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    await update.message.reply_text(
+        "🔥 <b>Welcome to Viral Video Bot</b>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
 
 # ===================== MENU =======================
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+
+    if q.data == "viral":
+        kb = [
+            [InlineKeyboardButton("🆕 Recent (5)", callback_data="recent")],
+            [InlineKeyboardButton("📂 All Videos", callback_data="all")]
+        ]
+        await q.message.reply_text(
+            "Choose an option:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif q.data == "how":
+        await q.message.reply_text(f"📺 {HOW_TO_WATCH_LINK}")
+
+    elif q.data in ("recent", "all"):
+        limit = "LIMIT 5" if q.data == "recent" else ""
+        cur.execute(f"""
+            SELECT title, link, preview_file_id, preview_type
+            FROM videos ORDER BY id DESC {limit}
+        """)
+        rows = cur.fetchall()
+        if not rows:
+            await q.message.reply_text("❌ No videos found.")
+            return
+
+        user_pages[uid] = {"videos": rows, "index": 0}
+        await send_card(context.bot, q.message.chat_id,
+                        rows[0], 0, len(rows))
+
+    elif q.data == "prev":
+        page = user_pages.get(uid)
+        if page and page["index"] > 0:
+            page["index"] -= 1
+            await send_card(context.bot, q.message.chat_id,
+                            page["videos"][page["index"]],
+                            page["index"], len(page["videos"]))
+
+    elif q.data == "next":
+        page = user_pages.get(uid)
+        if page and page["index"] < len(page["videos"]) - 1:
+            page["index"] += 1
+            await send_card(context.bot, q.message.chat_id,
+                            page["videos"][page["index"]],
+                            page["index"], len(page["videos"]))
+
+# ===================== TEXT =======================
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_states.get(uid) == "title":
+        context.user_data["title"] = text
+        user_states[uid] = "link"
+        await update.message.reply_text("🔗 Send video link")
+
+    elif user_states.get(uid) == "link":
+        cur.execute("""
+            INSERT INTO videos(title, link, preview_file_id, preview_type, created_at)
+            VALUES (?,?,?,?,?)
+        """, (
+            context.user_data["title"],
+            text,
+            context.user_data["preview"],
+            context.user_data["type"],
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+
+        user_states.pop(uid, None)
+        context.user_data.clear()
+        await update.message.reply_text("✅ Video added successfully")
+
+# ===================== MEDIA ======================
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if user_states.get(uid) == "preview":
+        if update.message.photo:
+            context.user_data["preview"] = update.message.photo[-1].file_id
+            context.user_data["type"] = "photo"
+        elif update.message.video:
+            context.user_data["preview"] = update.message.video.file_id
+            context.user_data["type"] = "video"
+
+        user_states[uid] = "title"
+        await update.message.reply_text("✏ Send video title")
+
+# ===================== ADMIN ======================
+async def addvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    user_states[update.effective_user.id] = "preview"
+    await update.message.reply_text("📸 Send preview image or video")
+
+# ===================== MAIN ======================
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addvideo", addvideo))
+    app.add_handler(CallbackQueryHandler(menu))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, media_handler))
+    app.add_handler(MessageHandler(filters.TEXT | filters.Entity("url"), text_handler))
+
+    app.run_polling()
+
+# ✅ CORRECT ENTRY POINT (DO NOT CHANGE)
+if __name__ == "__main__":
+    main()async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
