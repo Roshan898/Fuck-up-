@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-"""
-file_store_bot.py — Single combined bot
-- Free files (categories) with join-before-download checks (group + channel)
-- Paid files: admin sets price and uploads a QR image (photo or image file)
-- Buyers see the QR (uploaded by admin), press "I paid" -> admin approves/rejects -> on approve the buyer receives the file
-- Admin upload via Telegram document -> choose Free or Paid -> assign category
-- Admin commands: /listfiles, /setcat <file_id> <cat_key>, /removefile <file_id>, /id
-- SQLite DB: files + purchases
-"""
+# =================================================
+# Viral Video Bot with Preview + Prev/Next Buttons
+# Single Script | Render Ready
+# =================================================
+
 import logging
 import sqlite3
-import io
 from datetime import datetime
-from typing import Dict, Optional
 
 from telegram import (
     Update,
@@ -28,121 +22,217 @@ from telegram.ext import (
     filters,
 )
 
-# =======================
-# CONFIG — EDIT THESE
-# =======================
-BOT_TOKEN = "8306233846:AAGdHTLKmrspRYTg2U850EV5GpF1jUy1MtA"          # <-- replace with your bot token
-ADMIN_IDS = [7567632240]                    # <-- replace with your numeric Telegram ID(s)
+# ===================== CONFIG =====================
+BOT_TOKEN = "8359828511:AAH-TBlWFfDH_3T_MRM8YPULbb52mH3z12g"
+ADMIN_ID = 6567632240           # your Telegram numeric ID
+FORCE_JOIN = "@duvkuppp"    # channel or group username
+HOW_TO_WATCH_LINK = "https://t.me/yourchannel/123"
+# =================================================
 
-# Required join targets - set to "" to disable any check
-REQUIRED_GROUP = "@v1defyv"      # e.g. "@mygroup" or "" to disable
-REQUIRED_CHANNEL = "@defy_portal"  # e.g. "@mychannel" or "" to disable
+logging.basicConfig(level=logging.INFO)
 
-DB_PATH = "files_all.db"
-LOG_LEVEL = logging.INFO
-
-# Categories: key -> label (edit as you like)
-CATEGORIES: Dict[str, str] = {
-    "2010_2013": "2010–2013",
-    "2014_2018": "2014–2018",
-    "bizz": "Bizz Free Trial",
-    "meta": "45 Meta",
-    "all": "All Options",
-}
-
-# =======================
-# Logging & DB init
-# =======================
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=LOG_LEVEL)
-logger = logging.getLogger(__name__)
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# ===================== DATABASE ===================
+conn = sqlite3.connect("bot.db", check_same_thread=False)
 cur = conn.cursor()
 
-# files: if is_paid=1 then price/payment_qr_file_id used
 cur.execute("""
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id TEXT NOT NULL,
-    file_name TEXT,
-    category TEXT,
-    is_paid INTEGER DEFAULT 0,
-    price TEXT,
-    payment_qr_file_id TEXT,
-    upload_time TEXT,
-    uploader_id INTEGER
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY
 )
 """)
-# purchases: user requested payment for a file
+
 cur.execute("""
-CREATE TABLE IF NOT EXISTS purchases (
+CREATE TABLE IF NOT EXISTS videos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    file_row_id INTEGER,
-    status TEXT,  -- pending, approved, rejected
-    requested_at TEXT
+    title TEXT,
+    link TEXT,
+    preview_file_id TEXT,
+    preview_type TEXT,
+    created_at TEXT
 )
 """)
 conn.commit()
 
-# =======================
-# Helper UI builders
-# =======================
-def main_menu_kb():
-    rows = [[InlineKeyboardButton(label, callback_data=f"browse:{key}")] for key, label in CATEGORIES.items()]
-    rows.append([InlineKeyboardButton("🔥 Paid Files / Buy", callback_data="browse:paid")])
-    return InlineKeyboardMarkup(rows)
+# ===================== STATE ======================
+user_states = {}
+user_pages = {}  # user_id -> index
 
-def file_item_kb_for_user(row_id: int, is_paid: bool, price: Optional[str]):
-    kb = []
-    if is_paid:
-        kb.append([InlineKeyboardButton(f"💳 Buy ({price or 'Pay'})", callback_data=f"buy:{row_id}")])
-    else:
-        kb.append([InlineKeyboardButton("⬇ Download", callback_data=f"dl:{row_id}")])
-    return InlineKeyboardMarkup(kb)
-
-def admin_after_upload_kb(row_id: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Mark Free & Set Category", callback_data=f"admin_free:{row_id}")],
-        [InlineKeyboardButton("Set Paid (price then upload QR)", callback_data=f"admin_paid:{row_id}")]
-    ])
-
-def admin_purchase_kb(purchase_id: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Approve", callback_data=f"approve:{purchase_id}"),
-         InlineKeyboardButton("Reject", callback_data=f"reject:{purchase_id}")]
-    ])
-
-# =======================
-# Membership check helper
-# =======================
-async def is_member_of(bot, chat_identifier: str, user_id: int) -> bool:
-    if not chat_identifier:
-        return True
+# ================= FORCE JOIN =====================
+async def is_joined(bot, user_id):
     try:
-        member = await bot.get_chat_member(chat_id=chat_identifier, user_id=user_id)
-        if member.status in ("creator", "administrator", "member", "restricted"):
-            return True
-        return False
-    except Exception as e:
-        logger.warning("get_chat_member failed for %s user %s: %s", chat_identifier, user_id, e)
+        m = await bot.get_chat_member(FORCE_JOIN, user_id)
+        return m.status in ("member", "administrator", "creator")
+    except:
         return False
 
-# =======================
-# Commands
-# =======================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✨ Welcome! Browse categories below:", reply_markup=main_menu_kb())
+# ================= SEND PREVIEW ===================
+async def send_card(bot, chat_id, video, index, total):
+    title, link, file_id, file_type = video
+    caption = f"<b>{title}</b>\n{link}\n\n📄 {index+1}/{total}"
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start — Open menu\n/help — This help\n/id — show your numeric id\n\n"
-        "Admins: send a document to upload. After upload choose Free or Paid.\n"
-        "Admin commands: /listfiles, /setcat <file_id> <cat_key>, /removefile <file_id>"
-    )
+    buttons = []
+    if index > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data="prev"))
+    if index < total - 1:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data="next"))
 
-async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+
+    if file_id and file_type == "photo":
+        await bot.send_photo(chat_id, file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+    elif file_id and file_type == "video":
+        await bot.send_video(chat_id, file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=reply_markup)
+
+# ===================== START ======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    if not await is_joined(context.bot, user.id):
+        btn = [[InlineKeyboardButton("✅ Join Channel", url=f"https://t.me/{FORCE_JOIN.replace('@','')}")]]
+        await update.message.reply_text("❌ Join channel first.", reply_markup=InlineKeyboardMarkup(btn))
+        return
+
+    cur.execute("INSERT OR IGNORE INTO users VALUES(?)", (user.id,))
+    conn.commit()
+
+    kb = [
+        [InlineKeyboardButton("🔥 Viral Videos", callback_data="viral")],
+        [InlineKeyboardButton("📺 How to Watch", callback_data="how")],
+        [InlineKeyboardButton("🔍 Search Video", callback_data="search")]
+    ]
+
+    await update.message.reply_text("🔥 <b>Welcome</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+# ===================== MENU =======================
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+
+    if q.data == "viral":
+        kb = [
+            [InlineKeyboardButton("📌 Recent Videos", callback_data="recent")],
+            [InlineKeyboardButton("📂 All Videos", callback_data="all")]
+        ]
+        await q.message.reply_text("Choose option:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif q.data == "how":
+        await q.message.reply_text(f"📺 {HOW_TO_WATCH_LINK}")
+
+    elif q.data in ("recent", "all"):
+        limit = "LIMIT 10" if q.data == "recent" else ""
+        cur.execute(f"""
+        SELECT title, link, preview_file_id, preview_type
+        FROM videos ORDER BY id DESC {limit}
+        """)
+        rows = cur.fetchall()
+        if not rows:
+            await q.message.reply_text("❌ No videos.")
+            return
+
+        user_pages[uid] = {"videos": rows, "index": 0}
+        await send_card(context.bot, q.message.chat_id, rows[0], 0, len(rows))
+
+    elif q.data == "prev":
+        page = user_pages.get(uid)
+        if page and page["index"] > 0:
+            page["index"] -= 1
+            await send_card(context.bot, q.message.chat_id,
+                            page["videos"][page["index"]],
+                            page["index"], len(page["videos"]))
+
+    elif q.data == "next":
+        page = user_pages.get(uid)
+        if page and page["index"] < len(page["videos"]) - 1:
+            page["index"] += 1
+            await send_card(context.bot, q.message.chat_id,
+                            page["videos"][page["index"]],
+                            page["index"], len(page["videos"]))
+
+    elif q.data == "search":
+        user_states[uid] = "search"
+        await q.message.reply_text("🔍 Send keyword:")
+
+# ===================== TEXT =======================
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_states.get(uid) == "search":
+        cur.execute("""
+        SELECT title, link, preview_file_id, preview_type
+        FROM videos WHERE title LIKE ?
+        """, (f"%{text}%",))
+        rows = cur.fetchall()
+        user_states.pop(uid, None)
+
+        if not rows:
+            await update.message.reply_text("❌ No results.")
+            return
+
+        user_pages[uid] = {"videos": rows, "index": 0}
+        await send_card(context.bot, update.effective_chat.id, rows[0], 0, len(rows))
+        return
+
+    if user_states.get(uid) == "title":
+        context.user_data["title"] = text
+        user_states[uid] = "link"
+        await update.message.reply_text("🔗 Send video link")
+        return
+
+    if user_states.get(uid) == "link":
+        cur.execute("""
+        INSERT INTO videos VALUES (NULL,?,?,?,?,?)
+        """, (
+            context.user_data["title"],
+            text,
+            context.user_data["preview"],
+            context.user_data["type"],
+            datetime.now().isoformat()
+        ))
+        conn.commit()
+
+        await update.message.reply_text("✅ Video added")
+        user_states.pop(uid)
+        context.user_data.clear()
+
+# ===================== MEDIA ======================
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if user_states.get(uid) == "preview":
+        if update.message.photo:
+            context.user_data["preview"] = update.message.photo[-1].file_id
+            context.user_data["type"] = "photo"
+        elif update.message.video:
+            context.user_data["preview"] = update.message.video.file_id
+            context.user_data["type"] = "video"
+
+        user_states[uid] = "title"
+        await update.message.reply_text("✏️ Send video title")
+
+# ===================== ADMIN ======================
+async def addvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    user_states[update.effective_user.id] = "preview"
+    await update.message.reply_text("📸 Send preview image/video")
+
+# ===================== MAIN ======================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addvideo", addvideo))
+    app.add_handler(CallbackQueryHandler(menu))
+    app.add_handler(MessageHandler(filters.TEXT | filters.Entity("url"), text_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, media_handler))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()    u = update.effective_user
     await update.message.reply_text(f"Your numeric id: {u.id}\nusername: @{u.username or 'unknown'}")
 
 async def listfiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
